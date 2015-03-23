@@ -9,31 +9,73 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.net.NetworkInfo;
 import android.net.wifi.p2p.WifiP2pConfig;
 import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pDeviceList;
+import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.net.wifi.p2p.WifiP2pManager.Channel;
+import android.os.Handler;
+import android.os.Message;
 import android.support.v7.app.ActionBarActivity;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.EditText;
+import android.widget.ListView;
 import android.widget.Toast;
 
+import java.io.IOException;
+import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 
 
-public class MainActivity extends ActionBarActivity {
+public class MainActivity extends ActionBarActivity implements Handler.Callback, WifiP2pManager.ConnectionInfoListener {
 
+    public static final String TAG = "MyChat";
+    public static final int MY_CHAT = 0;
+    public static final int MSG_READ = 1;
     private WifiP2pManager wifiManager;
     private Channel channel;
     private WiFiDirectBroadcastReceiver receiver;
     private IntentFilter mIntentFilter;
+    private Handler handler = new Handler(this);
+    public static final int SERVER_PORT = 4545;
+    private Chat chat=null;
+    private EditText editText;
+    private ListView listView;
+    ArrayAdapter adapter = null;
+    private List<String> items = new ArrayList<String>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        editText = (EditText) findViewById(R.id.et_text);
+        listView = (ListView) findViewById(R.id.list_view);
+        adapter = new ArrayAdapter(this, android.R.layout.simple_list_item_1, items);
+        listView.setAdapter(adapter);
+        findViewById(R.id.btn_send).setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View arg0) {
+                        if (chat != null) {
+                            chat.write(editText.getText().toString()
+                                    .getBytes());
+                            pushMessage("Me: " + editText.getText().toString());
+                            editText.setText("");
+                            editText.clearFocus();
+                        }
+                    }
+                });
+
         wifiManager = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
         channel = wifiManager.initialize(this, getMainLooper(), null);
         receiver = new WiFiDirectBroadcastReceiver(wifiManager, channel, this);
@@ -43,6 +85,8 @@ public class MainActivity extends ActionBarActivity {
         mIntentFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
         mIntentFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
         mIntentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
+
+
     }
 
     @Override
@@ -83,6 +127,49 @@ public class MainActivity extends ActionBarActivity {
         return super.onOptionsItemSelected(item);
     }
 
+    @Override
+    public void onConnectionInfoAvailable(WifiP2pInfo info) {
+        Thread chatThread = null;
+        InetAddress groupOwnerAddress = info.groupOwnerAddress;
+        Log.d(TAG, "onConnectionInfoAvailable: " + groupOwnerAddress.getHostAddress());
+        if (info.groupFormed && info.isGroupOwner) {
+
+            Log.d(TAG, "onConnectionInfoAvailable: device is groupOwner - act like server");
+            try {
+                chatThread = new ServerSocketThread(handler);
+                chatThread.start();
+            } catch (IOException e) {
+                Log.d(TAG,
+                        "Failed to create a server thread - " + e.getMessage());
+                return;
+            }
+        } else if (info.groupFormed) {
+
+            Log.d(TAG, "onConnectionInfoAvailable: device is client, connect to group owner");
+            chatThread = new ClientSocketThread(handler, info.groupOwnerAddress);
+            chatThread.start();
+        }
+    }
+
+    @Override
+    public boolean handleMessage(Message msg) {
+        switch (msg.what) {
+            case MY_CHAT:
+                chat =(Chat) msg.obj;
+                break;
+            case MSG_READ:
+                byte[] readBuf = (byte[]) msg.obj;
+                String readMessage = new String(readBuf, 0, msg.arg1);
+                Log.d(TAG, readMessage);
+                pushMessage("Received: " + readMessage);
+        }
+        return true;
+
+    }
+    public void pushMessage(String readMessage) {
+        adapter.add(readMessage);
+        adapter.notifyDataSetChanged();
+    }
 
     public class WiFiDirectBroadcastReceiver extends BroadcastReceiver {
 
@@ -118,9 +205,9 @@ public class MainActivity extends ActionBarActivity {
                     public void onPeersAvailable(WifiP2pDeviceList peers) {
                         Collection<WifiP2pDevice> deviceList = peers.getDeviceList();
                         //самое простое создать диалог но не правильно. лучший вариант поискать диалог
-                        FragmentManager fragmentManager=getFragmentManager();
-                        DialogFragment dialog=(DialogFragment)fragmentManager.findFragmentByTag("PeersDialog");
-                        if (dialog!=null){
+                        FragmentManager fragmentManager = getFragmentManager();
+                        DialogFragment dialog = (DialogFragment) fragmentManager.findFragmentByTag("PeersDialog");
+                        if (dialog != null) {
                             dialog.dismiss();
                         }
                         PeersDialog.newInstance(deviceList).show(fragmentManager, "PeersDialog");
@@ -128,6 +215,16 @@ public class MainActivity extends ActionBarActivity {
                 });
             } else if (WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION.equals(action)) {
                 // Respond to new connection or disconnections
+                if (mManager == null) {
+                    return;
+                }
+                NetworkInfo networkInfo = (NetworkInfo) intent
+                        .getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
+                if (networkInfo.isConnected()) {
+                    // We are connected with the other device, request connection
+                    // info to find group owner IP
+                    mManager.requestConnectionInfo(mChannel, MainActivity.this);
+                }
             } else if (WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION.equals(action)) {
                 // Respond to this device's wifi state changing
             }
@@ -143,10 +240,10 @@ public class MainActivity extends ActionBarActivity {
             @Override
             public void onSuccess() {
                 Toast.makeText(MainActivity.this, "Connected to " + device.deviceName, Toast.LENGTH_SHORT).show();
-                wifiManager.stopPeerDiscovery(channel,new WifiP2pManager.ActionListener() {
+                wifiManager.stopPeerDiscovery(channel, new WifiP2pManager.ActionListener() {
                     @Override
                     public void onSuccess() {
-                        
+
                     }
 
                     @Override
